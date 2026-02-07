@@ -1,0 +1,368 @@
+services:
+  # ============================================
+  # ZOOKEEPER - Kafka Coordination
+  # ============================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: hft_zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - hft_network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================
+  # KAFKA - Message Broker
+  # ============================================
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: hft_kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_RETENTION_BYTES: 1073741824
+    networks:
+      - hft_network
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # ============================================
+  # REDIS - Feature Store Online (Feast)
+  # ============================================
+  redis:
+    image: redis:7.2-alpine
+    container_name: hft_redis
+    ports:
+      - "6380:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - hft_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ============================================
+  # TIMESCALEDB - Time-series Database
+  # Using port 5433 to avoid conflict with existing PostgreSQL on 5432
+  # ============================================
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: hft_timescaledb
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_USER: hft_user
+      POSTGRES_PASSWORD: hft_password
+      POSTGRES_DB: hft_trading
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      - ./scripts/init_timescaledb.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - hft_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hft_user -d hft_trading"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================
+  # KAFKA UI - Monitoring Dashboard
+  # ============================================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: hft_kafka_ui
+    ports:
+      - "8085:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: hft-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+      DYNAMIC_CONFIG_ENABLED: "true"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - hft_network
+
+  # ============================================
+  # KAFKA EXPORTER - Prometheus Metrics for Kafka
+  # ============================================
+  kafka-exporter:
+    image: danielqsj/kafka-exporter
+    container_name: hft_kafka_exporter
+    command: ["--kafka.server=kafka:29092"]
+    ports:
+      - "9308:9308"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - hft_network
+
+  # ============================================
+  # MARKET PRODUCER - Binance WebSocket → Kafka
+  # ============================================
+  data-ingestor:
+    build: ./services/data_ingestor
+    container_name: hft_data_ingestor
+    depends_on:
+      kafka:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: market_ticks
+      TIMESCALE_HOST: timescaledb
+      TIMESCALE_PORT: 5432
+      TIMESCALE_USER: hft_user
+      TIMESCALE_PASSWORD: hft_password
+      TIMESCALE_DB: hft_trading
+    networks:
+      - hft_network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+  market-producer:
+    build: ./services/market_producer
+    container_name: hft_market_producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: market_ticks
+      SYMBOL: BTC/USDT
+    networks:
+      - hft_network
+    restart: unless-stopped
+
+  # ============================================
+  # FEATURE CALCULATOR - Technical Indicators
+  # CPU-optimized for laptop performance
+  # ============================================
+  feature-calculator:
+    build: ./services/feature_calculator
+    container_name: hft_feature_calculator
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: market_ticks
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    volumes:
+      - ./feast/feature_repo/data:/app/data
+    networks:
+      - hft_network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+
+  # ============================================
+  # MLFLOW - Model Registry & Experiment Tracking
+  # ============================================
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.10.0
+    container_name: hft_mlflow
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlflow:/mlflow
+    command: >
+      mlflow server 
+      --host 0.0.0.0 
+      --port 5000 
+      --backend-store-uri sqlite:///mlflow/mlflow.db 
+      --default-artifact-root /mlflow/artifacts
+    networks:
+      - hft_network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ============================================
+  # MODEL TRAINER - Automated Training Pipeline
+  # Runs once to train and register model
+  # ============================================
+  model-trainer:
+    build: ./models
+    container_name: hft_model_trainer
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    volumes:
+      - ./mlflow:/mlflow
+    networks:
+      - hft_network
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
+
+  # ============================================
+  # MODEL SERVER - Real-time Inference API
+  # ============================================
+  model-server:
+    build: ./services/model_server
+    container_name: hft_model_server
+    ports:
+      - "8001:8001"
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: hft-xgboost-classifier
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      SYMBOL: BTC/USDT
+    volumes:
+      - ./mlflow:/mlflow
+    networks:
+      - hft_network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+
+  # ============================================
+  # TRADING BOT - Automated Trading Simulation
+  # ============================================
+  trading-bot:
+    build: ./services/trading_bot
+    container_name: hft_trading_bot
+    ports:
+      - "8002:8002"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: market_ticks
+      MODEL_SERVER_URL: http://model-server:8001
+      TIMESCALE_HOST: timescaledb
+      TIMESCALE_PORT: 5432
+      TIMESCALE_USER: hft_user
+      TIMESCALE_PASSWORD: hft_password
+      TIMESCALE_DB: hft_trading
+      CONFIDENCE_THRESHOLD: "0.55"
+      SYMBOL: BTC/USDT
+      TRADE_AMOUNT: "0.01"
+    networks:
+      - hft_network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 256M
+
+  # ============================================
+  # DASHBOARD - Real-time Streamlit UI
+  # ============================================
+  dashboard:
+    build: ./services/dashboard
+    container_name: hft_dashboard
+    ports:
+      - "8501:8501"
+    depends_on:
+      - trading-bot
+      - model-server
+    environment:
+      MODEL_SERVER_URL: http://model-server:8001
+      TRADING_BOT_URL: http://trading-bot:8002
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    networks:
+      - hft_network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: hft_prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    ports:
+      - "9090:9090"
+    networks:
+      - hft_network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: hft_grafana
+    depends_on:
+      - prometheus
+    ports:
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    networks:
+      - hft_network
+
+networks:
+  hft_network:
+    driver: bridge
+
+volumes:
+  redis_data:
+  timescale_data:
+  mlflow_data:

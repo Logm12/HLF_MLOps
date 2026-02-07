@@ -1,0 +1,12 @@
+mlflow==2.10.0
+cloudpickle==3.1.2
+lightgbm==4.6.0
+matplotlib==3.10.8
+numpy==1.26.4
+packaging==23.2
+pandas==2.3.3
+pyarrow==15.0.2
+pyyaml==6.0.3
+scikit-learn==1.8.0
+scipy==1.17.0
+xgboost==3.1.3

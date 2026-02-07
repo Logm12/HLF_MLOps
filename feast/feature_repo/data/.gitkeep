@@ -1,0 +1,2 @@
+# This directory stores Feast offline data (Parquet files)
+# It is mounted as a volume in the feature-calculator container
