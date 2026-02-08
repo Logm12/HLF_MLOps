@@ -56,6 +56,30 @@ To view service logs:
 docker-compose logs -f trading-bot
 ```
 
+## System Architecture Diagram
+
+<p align="center">
+  <img src="./assets/HFT_archtechture_diagrams.png" alt="Architechture Diagram" width="100%">
+</p>
+
+
+## How It Works
+
+The system operates as a continuous loop of data ingestion, processing, and decision-making:
+
+1.  **Market Data Ingestion**: The **Market Producer** maintains a persistent WebSocket connection to the Binance Exchange, receiving real-time trade execution data (ticks). Every new tick is immediately pushed to a dedicated topic in **Apache Kafka**.
+
+2.  **Streaming & Feature Calculation**: **Kafka** streams these ticks to the **Feature Calculator** service. This service processes the raw price and volume data on-the-fly to compute technical indicators (like RSI and MACD).
+
+3.  **Dual-Storage Strategy**:
+    *   **Hot Storage (Redis)**: The computed features are written to **Redis**, which acts as an ultra-low latency online store. This ensures the trading bot always has access to the most recent market state (sub-millisecond access).
+    *   **Cold Storage (TimescaleDB)**: Simultaneously, the **Data Ingestor** saves the raw tick data to **TimescaleDB** for long-term archival and future model retraining.
+
+4.  **Inference & Execution**:
+    *   The **Trading Bot** constantly polls the market state. When a potential opportunity arises, it sends a prediction request to the **Model Server**.
+    *   The Model Server fetches the latest feature vector directly from **Redis**, runs it through the ensemble model, and returns a confidence score.
+    *   If the score exceeds a threshold, the bot executes a buy or sell order back to Binance (currently simulated).
+
 ## Architecture
 
 The system consists of the following isolated services:

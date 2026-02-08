@@ -11,7 +11,21 @@ The solution leverages a microservices architecture, implementing a Feature Stor
 
 The system follows a modular microservices architecture designed for scalability, maintainability, and fault tolerance.
 
-### 2.1. Architectural Components
+<p align="center">
+  <img src="./assets/HFT_archtechture_diagrams.png" alt="Architechture Diagram" width="100%">
+</p>
+
+### 2.1. System Flow Overview
+
+The architecture facilitates a high-speed data pipeline tailored for algorithmic trading:
+
+1.  **Market Data Socket**: The system connects to the Binance WebSocket API via the **Market Producer**, ensuring real-time receipt of trade ticks. This data is immediately published to **Apache Kafka**.
+2.  **Stream Processing**: The **Feature Calculator** service consumes the Kafka stream. It calculates technical indicators (RSI, Moving Averages) on the fly and pushes the results to **Redis** (the Online Feature Store).
+3.  **Data Persistence**: A separate **Data Ingestor** service writes the raw tick data to **TimescaleDB**. This creates a historical record used for offline model training and backtesting.
+4.  **Signal Generation**: The **Trading Bot** continuously monitors market conditions. Upon identifying a potential trade setup, it queries the **Model Server**, which retrieves the latest features from Redis and returns a prediction confidence score.
+5.  **Execution and Monitoring**: High-confidence predictions trigger mock orders. All system metrics (latency, memory usage) are scraped by **Prometheus** and visualized on **Grafana**, while trading performance is tracked on the **Streamlit** dashboard.
+
+### 2.2. Architectural Components
 
 *   **Data Layer**:
     *   **TimescaleDB**: Used for persistent storage of historical market data (ticks), optimized for time-series queries.
